@@ -43,6 +43,10 @@ bert_model = AutoModel.from_pretrained(Params.bert_model, local_files_only=False
 
 
 def init_process(rank, world_size):
+	# Only initialize process group when we actually use distributed mode (multi-GPU)
+	if world_size <= 1:
+		return
+
 	os.environ['MASTER_ADDR'] = '127.0.0.1'
 	os.environ['MASTER_PORT'] = Params.ddp_master_port
 
@@ -85,13 +89,13 @@ def get_model(rank, device, checkpoint, output_dir):
 			'freeze_encoder': Params.freeze_encoder
 		}
 
-	# Save config to output directory
+	# Save config to output directory (use default=str to serialize any numpy dtype)
 	if (rank == 0):
 		out_config_path = os.path.join(output_dir, 'config.json')
 		logger.info(f'Saving config into {out_config_path}')
 
 		with open(out_config_path, 'w') as f:
-			json.dump(config, f, indent=4)
+			json.dump(config, f, indent=4, default=str)
 
 	model = BertAbsSum(config=config, device=device)
 
@@ -101,17 +105,17 @@ def get_model(rank, device, checkpoint, output_dir):
 
 	model.to(device)
 
-	if torch.cuda.is_available():
-		if num_gpus > 1:
-			model = DistributedDataParallel(model, device_ids=[device], output_device=device, find_unused_parameters=True)
-	else:
-		model = DistributedDataParallel(model, find_unused_parameters=True)
+	# Wrap with DDP ONLY when we actually have multi-GPU (num_gpus > 1)
+	if torch.cuda.is_available() and num_gpus > 1:
+		model = DistributedDataParallel(model, device_ids=[device], output_device=device, find_unused_parameters=True)
 
 	return model
 
 
 def get_optimizer(model, checkpoint):
-	model_params = list(model.named_parameters())
+	# When model is DDP, named_parameters are on the underlying module
+	params_iter = model.module.named_parameters() if isinstance(model, DistributedDataParallel) else model.named_parameters()
+	model_params = list(params_iter)
 	no_decay_params = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 
 	grouped_params = [
@@ -136,6 +140,7 @@ def get_train_dataloader(rank, world_size):
 
 	train_dataset = torch.load(Params.train_data_path)
 
+	# Use distributed dataloader only when multi-GPU
 	if num_gpus == 1:
 		train_dataloader = processor.create_dataloader(train_dataset, Params.train_batch_size)
 	else:
@@ -220,22 +225,10 @@ def do_validate(valid_dataloader, model, device, epoch_no):
 				batch_tgt_mask=batch_tgt_mask)
 			loss, n_correct, n_tokens = cal_performance(logits, batch_tgt_ids)
 
-			# del batch_src_ids
-			# del batch_src_mask
-			# del batch_tgt_mask
-			# gc.collect()
-			# torch.cuda.empty_cache()
-
 			total_valid_loss += loss.item()
 			valid_steps_num += 1
 
 			valid_iterator.set_postfix({'Loss': loss.item(), 'Correct': f'{n_correct}/{n_tokens}'})
-
-			# del batch_tgt_ids
-			# del logits
-			# del loss
-			# gc.collect()
-			# torch.cuda.empty_cache()
 
 			if step == 5 and Params.quick_test:
 				break   # For quick testing
@@ -266,7 +259,13 @@ def cleanup_older_checkpoints(output_dir, current_epoch):
 
 def train(rank, world_size, output_dir):
 	print('\n\n')
-	init_process(rank, world_size)
+
+	# init process group only if using multi-gpu
+	if world_size > 1:
+		init_process(rank, world_size)
+	else:
+		# no distributed init required
+		pass
 
 	device = torch.device(f'cuda:{rank}') if torch.cuda.is_available() else torch.device('cpu')
 	checkpoint = None
@@ -286,6 +285,7 @@ def train(rank, world_size, output_dir):
 		else:
 			logger.info(f'Check point valid. Last loss = {checkpoint["loss"]}')
 
+	# Use barrier only in multi-gpu
 	if num_gpus != 1:
 		dist.barrier()
 		logger.info(f'Rank {rank}/{world_size} training process passed blocking barrier.')
@@ -396,12 +396,6 @@ def train(rank, world_size, output_dir):
 				batch_tgt_mask=batch_tgt_mask)
 			loss, n_correct, n_tokens = cal_performance(logits, batch_tgt_ids)
 
-			# del batch_src_ids
-			# del batch_src_mask
-			# del batch_tgt_mask
-			# gc.collect()
-			# torch.cuda.empty_cache()
-
 			actual_loss = loss.item()
 			learning_rate = optimizer.param_groups[0]['lr']
 
@@ -460,12 +454,6 @@ def train(rank, world_size, output_dir):
 					})
 
 					save_training_log(output_dir, training_log)
-
-			# del batch_tgt_ids
-			# del logits
-			# del loss
-			# gc.collect()
-			# torch.cuda.empty_cache()
 
 			total_train_loss += actual_loss
 			train_examples_num += len(batch_guids)
@@ -554,11 +542,12 @@ def cleanup_on_error(output_dir):
 
 
 if __name__ == '__main__':
+	# For single-GPU Colab, set WORLD_SIZE = 1
 	if torch.cuda.is_available():
 		WORLD_SIZE = torch.cuda.device_count()
 	else:
-		WORLD_SIZE = 2	# Testing with CPU
-	
+		WORLD_SIZE = 1	# run single-process on CPU
+
 	if torch.cuda.device_count() > 1:
 		logger.info(f'Parallel training using {torch.cuda.device_count()} GPUs!')
 
@@ -572,7 +561,7 @@ if __name__ == '__main__':
 		os.makedirs(output_dir, exist_ok=True)
 		logger.info(f'Model output dir: {output_dir}')
 
-		if num_gpus == 1:
+		if WORLD_SIZE == 1:
 			# Do single process training
 			train(0, 1, output_dir=output_dir)
 		else:
