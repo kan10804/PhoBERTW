@@ -1,349 +1,151 @@
-import torch.nn as nn
+# transformer_model.py
+# BertAbsSum model (PhoBERT encoder + Transformer decoder)
+# Includes BertDecoder, BertPositionEmbedding, and BertAbsSum.
+# Ensure this file is placed in your src/ (or update imports accordingly).
+
 import torch
-import operator
-from torch.nn.functional import log_softmax
-from transformer.Layers import DecoderLayer
-from transformer.Models2 import get_non_pad_mask, get_sinusoid_encoding_table, get_attn_key_pad_mask, get_subsequent_mask
+import torch.nn as nn
 from transformers import AutoModel, BertConfig
 from transformers.models.bert.modeling_bert import BertEmbeddings
-from transformer_utils import *
-from params_helper import Params, Constants
+
+from transformer_utils import timing, get_logger
+
+# Các hàm lớp DecoderLayer, Models2... bạn vẫn dùng từ repo gốc (src/transformer)
+# đảm bảo đường dẫn import đúng (bạn đã có file Layers.py và Models2.py)
+from src.transformer.Layers import DecoderLayer
+from src.transformer.Models2 import (
+    get_non_pad_mask,
+    get_sinusoid_encoding_table,
+    get_attn_key_pad_mask,
+    get_subsequent_mask
+)
 
 logger = get_logger(__name__)
 
+
 class BertPositionEmbedding(nn.Module):
-	def __init__(self, max_seq_len, hidden_size, padding_idx=0):
-		super().__init__()
+    def __init__(self, max_seq_len, hidden_size):
+        super().__init__()
+        table = get_sinusoid_encoding_table(
+            n_position=max_seq_len + 1,
+            d_hid=hidden_size,
+            padding_idx=0
+        )
+        self.embedding = nn.Embedding.from_pretrained(table, freeze=True)
 
-		sinusoid_encoding = get_sinusoid_encoding_table(
-			n_position=max_seq_len + 1, # Add 1 for the first zero position
-			d_hid=hidden_size,
-			padding_idx=padding_idx)
-
-		self.embedding = nn.Embedding.from_pretrained(embeddings=sinusoid_encoding, freeze=True)
-
-	def forward(self, x):
-		return self.embedding(x)
+    def forward(self, x):
+        return self.embedding(x)
 
 
 class BertDecoder(nn.Module):
-	def __init__(self, config, device, dropout=0.1):
-		super().__init__()
+    def __init__(self, config, constants, device):
+        super().__init__()
+        self.device = device
+        self.constants = constants
 
-		self.device = device
-		bert_config = BertConfig.from_dict(config['bert_config'])
-		decoder_config = config['decoder_config']
-		n_layers = decoder_config['n_layers']
-		n_head = decoder_config['n_head']
-		d_k = decoder_config['d_k']
-		d_v = decoder_config['d_v']
-		d_model = decoder_config['d_model']
-		d_inner = decoder_config['d_inner']
-		vocab_size = decoder_config['vocab_size']
+        bert_conf = BertConfig.from_dict(config["bert_config"])
+        dec = config["decoder_config"]
 
-		self.sequence_embedding = BertEmbeddings(config=bert_config)
-		self.position_embedding = BertPositionEmbedding(max_seq_len=Constants.MAX_TGT_SEQ_LEN, hidden_size=d_model)
-		self.layer_stack = nn.ModuleList([DecoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout) for _ in range(n_layers)])
-		self.last_linear = nn.Linear(in_features=d_model, out_features=vocab_size)
+        # Use BertEmbeddings for token/segment/position embeddings (wordpiece compat)
+        self.seq_embedding = BertEmbeddings(bert_conf)
+        # position embedding is sinusoidal table (wrapped as embedding)
+        self.pos_embedding = BertPositionEmbedding(
+            max_seq_len=constants.MAX_TGT_SEQ_LEN,
+            hidden_size=dec["d_model"]
+        )
 
-	@timing
-	def forward(self, batch_src_seq, batch_enc_output, batch_tgt_seq):
-		batch_tgt_seq = batch_tgt_seq.to(self.device)
-		dec_slf_attn_list, dec_enc_attn_list = [], []
+        # Transformer decoder layers (your Layers.DecoderLayer)
+        self.layers = nn.ModuleList([
+            DecoderLayer(
+                d_model=dec["d_model"],
+                d_inner=dec["d_inner"],
+                n_head=dec["n_head"],
+                d_k=dec["d_k"],
+                d_v=dec["d_v"]
+            ) for _ in range(dec["n_layers"])
+        ])
 
-		# -- Prepare masks
-		dec_non_pad_mask = get_non_pad_mask(batch_tgt_seq)
+        # final linear projection to vocab
+        self.linear = nn.Linear(dec["d_model"], dec["vocab_size"])
 
-		slf_attn_mask_subseq = get_subsequent_mask(batch_tgt_seq)
-		slf_attn_mask_keypad = get_attn_key_pad_mask(seq_k=batch_tgt_seq, seq_q=batch_tgt_seq)
-		dec_slf_attn_mask = (slf_attn_mask_keypad + slf_attn_mask_subseq).gt(0)
+    @timing
+    def forward(self, src_seq, enc_output, tgt_seq):
+        """
+        src_seq: (B, S) - needed to create enc_mask (attention pad mask)
+        enc_output: (B, S_enc, D)
+        tgt_seq: (B, T)
+        returns: logits (B, T, V), None
+        """
+        tgt_seq = tgt_seq.to(self.device)
 
-		dec_enc_attn_mask = get_attn_key_pad_mask(seq_k=batch_src_seq, seq_q=batch_tgt_seq)
+        batch_size, length = tgt_seq.size()
+        pos = torch.arange(1, length + 1).unsqueeze(0).repeat(batch_size, 1).to(self.device)
 
-		batch_size, tgt_seq_len = batch_tgt_seq.size()
-		batch_tgt_pos = torch.arange(1, tgt_seq_len + 1).unsqueeze(0).repeat(batch_size, 1).to(self.device)
+        dec_mask = (get_attn_key_pad_mask(tgt_seq, tgt_seq) +
+                    get_subsequent_mask(tgt_seq)).gt(0)
+        non_pad = get_non_pad_mask(tgt_seq)
+        enc_mask = get_attn_key_pad_mask(src_seq, tgt_seq)
 
-		dec_output = self.sequence_embedding(batch_tgt_seq) + self.position_embedding(batch_tgt_pos)
+        out = self.seq_embedding(tgt_seq) + self.pos_embedding(pos)
 
-		# -- Forward
-		for dec_layer in self.layer_stack:
-			dec_output, dec_slf_attn, dec_enc_attn = dec_layer(
-				dec_output, batch_enc_output,
-				non_pad_mask=dec_non_pad_mask,
-				slf_attn_mask=dec_slf_attn_mask,
-				dec_enc_attn_mask=dec_enc_attn_mask)
+        for layer in self.layers:
+            out, _, _ = layer(out, enc_output, non_pad, dec_mask, enc_mask)
 
-			dec_slf_attn_list.append(dec_slf_attn)
-			dec_enc_attn_list.append(dec_enc_attn)
-
-		batch_logits = self.last_linear(dec_output)
-
-		return batch_logits, dec_enc_attn_list
+        return self.linear(out), None
 
 
 class BertAbsSum(nn.Module):
-	def __init__(self, config, device):
-		super().__init__()
+    """
+    PhoBERT (or other BERT) encoder + Transformer decoder for abstractive summarization.
+    config: dict with "bert_model", "bert_config", "decoder_config", "freeze_encoder" keys
+    constants: object with PAD/BOS/EOS/MAX_TGT_SEQ_LEN
+    device: 'cpu' or 'cuda'
+    """
+    def __init__(self, config, constants, device):
+        super().__init__()
+        # store config so we can save it in checkpoint and use at inference
+        self.config = config
+        self.device = device
+        self.constants = constants
 
-		self.device = device
-		self.config = config
-		self.encoder = AutoModel.from_pretrained(config['bert_model'])
+        # encoder from transformers (PhoBERT)
+        self.encoder = AutoModel.from_pretrained(config["bert_model"])
 
-		# Freeze encoder
-		if config['freeze_encoder'] == True:
-			for param in self.encoder.parameters():
-				param.requires_grad = False
+        if config.get("freeze_encoder", False):
+            for p in self.encoder.parameters():
+                p.requires_grad = False
 
-		self.decoder = BertDecoder(config=config, device=device)
+        # decoder instance
+        self.decoder = BertDecoder(config, constants, device)
 
-		# Count total params
-		stats = self.get_model_stats()
-		enc_params = stats['enc_params']
-		dec_params = stats['dec_params']
-		total_params = stats['total_params']
-		logger.info(f'Encoder total parameters: {enc_params:,}')
-		logger.info(f'Decoder total parameters: {dec_params:,}')
-		logger.info(f'Total model parameters: {total_params:,}')
-		
-		if Params.mode == 'train':
-			enc_trainable_params = stats['enc_trainable_params']
-			dec_trainable_params = stats['dec_trainable_params']
-			total_trainable_params = stats['total_trainable_params']
-			logger.info(f'Encoder trainable parameters: {enc_trainable_params:,}')
-			logger.info(f'Decoder trainable parameters: {dec_trainable_params:,}')
-			logger.info(f'Total trainable parameters: {total_trainable_params:,}')
+    def batch_encode_src_seq(self, src, mask):
+        # return last_hidden_state
+        return self.encoder(input_ids=src, attention_mask=mask)[0]
 
-	def get_model_stats(self):
-		enc_params = sum(p.numel() for p in self.encoder.parameters())
-		dec_params = sum(p.numel() for p in self.decoder.parameters())
-		total_params = enc_params + dec_params
+    def forward(self, batch_src_seq, batch_src_mask, batch_tgt_seq, batch_tgt_mask):
+        # used during training: returns logits (B, T, V)
+        enc_out = self.batch_encode_src_seq(batch_src_seq, batch_src_mask)
+        logits, _ = self.decoder(batch_src_seq, enc_out, batch_tgt_seq)
+        return logits
 
-		enc_trainable_params = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
-		dec_trainable_params = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
-		total_trainable_params = enc_trainable_params + dec_trainable_params
+    @timing
+    def greedy_decode(self, batch):
+        """
+        batch: tuple like (None, ids, mask, None, None) used by web.py
+        returns: dec_seq (tensor) (B, T_generated)
+        """
+        src = batch[1].to(self.device)
+        mask = batch[2].to(self.device)
 
-		stats = {
-			'enc_params': enc_params,
-			'dec_params': dec_params,
-			'total_params': total_params,
-			'enc_trainable_params': enc_trainable_params,
-			'dec_trainable_params': dec_trainable_params,
-			'total_trainable_params': total_trainable_params,
-		}
+        enc_out = self.batch_encode_src_seq(src, mask)
 
-		return stats
+        dec_seq = torch.full((src.size(0), 1),
+                             self.constants.BOS,
+                             dtype=torch.long).to(self.device)
 
-	# @timing
-	def forward(self, batch_src_seq, batch_src_mask, batch_tgt_seq, batch_tgt_mask):
-		# src/tgt shape: (batch_size, seq_len)
+        for _ in range(self.constants.MAX_TGT_SEQ_LEN):
+            logits, _ = self.decoder(src, enc_out, dec_seq)
+            next_tok = logits[:, -1].argmax(-1).unsqueeze(1)
+            dec_seq = torch.cat([dec_seq, next_tok], dim=1)
 
-		# shift right
-		batch_tgt_seq = batch_tgt_seq[:, :-1]
-		batch_tgt_mask = batch_tgt_mask[:, :-1]
-
-		# TODO: pass invterval token_type_ids as addition info like PreSum
-		batch_enc_output = self.batch_encode_src_seq(batch_src_seq=batch_src_seq, batch_src_mask=batch_src_mask)  							# [batch_size, seq_len, hidden_size]	
-		batch_logits, _ = self.decoder.forward(batch_src_seq=batch_src_seq, batch_enc_output=batch_enc_output, batch_tgt_seq=batch_tgt_seq)	# [batch_size, seq_len, vocab_size]
-		return batch_logits
-
-	def batch_encode_src_seq(self, batch_src_seq, batch_src_mask):
-		# Use window to scan the full input sequence (max 256) if the model is PhoBERT and the input data is longer than 256 tokens
-		if 'phobert' in Params.bert_model and Params.max_src_len > 256:
-			window_size = 256
-			batch_src_seq1 = batch_src_seq[:,:window_size]
-			batch_src_seq2 = batch_src_seq[:,window_size:]
-			batch_src_mask1 = batch_src_mask[:,:window_size]
-			batch_src_mask2 = batch_src_mask[:,window_size:]
-			
-			batch_enc_output1 = self.encoder.forward(input_ids=batch_src_seq1, attention_mask=batch_src_mask1)[0]	# [batch_size, window_size, hidden_size]
-			batch_enc_output2 = self.encoder.forward(input_ids=batch_src_seq2, attention_mask=batch_src_mask2)[0]	# [batch_size, window_size, hidden_size]
-			batch_enc_output = torch.cat([batch_enc_output1, batch_enc_output2], dim=1)								# [batch_size, full_seq_len, hidden_size]
-		# Otherwise, encode the input sequence as usual
-		else:
-			batch_enc_output = self.encoder.forward(input_ids=batch_src_seq, attention_mask=batch_src_mask)[0]  	# [batch_size, seq_len, hidden_size]
-
-		return batch_enc_output
-
-	@timing
-	def greedy_decode(self, batch):
-		# Batch is a tuple of tensors (guids, src_ids, scr_mask, tgt_ids, tgt_mask)
-		batch_src_seq = batch[1].to(self.device)
-		batch_src_mask = batch[2].to(self.device)
-
-		batch_enc_output = self.batch_encode_src_seq(batch_src_seq=batch_src_seq, batch_src_mask=batch_src_mask)	# [batch_size, seq_len, hidden_size]	
-		batch_dec_seq = torch.full((batch_src_seq.size(0),), Constants.BOS, dtype=torch.long)
-		batch_dec_seq = batch_dec_seq.unsqueeze(-1).type_as(batch_src_seq)
-
-		for i in range(Constants.MAX_TGT_SEQ_LEN):
-			output_logits, _ = self.decoder.forward(batch_src_seq=batch_src_seq, batch_enc_output=batch_enc_output, batch_tgt_seq=batch_dec_seq)
-			dec_output = output_logits.max(-1)[1]
-			dec_output = dec_output[:, -1]
-			batch_dec_seq = torch.cat((batch_dec_seq, dec_output.unsqueeze(-1)), 1)
-
-		return batch_dec_seq
-
-	@timing
-	def beam_decode(self, batch_guids, batch_src_seq, batch_src_mask, beam_size, n_best):
-		batch_size = len(batch_guids)
-		batch_src_seq = batch_src_seq.to(self.device)
-		batch_src_mask = batch_src_mask.to(self.device)
-
-		batch_enc_output = self.batch_encode_src_seq(batch_src_seq=batch_src_seq, batch_src_mask=batch_src_mask)	# [batch_size, seq_len, hidden_size]
-		decoded_batch = []
-
-		# Decoding goes through each sample in the batch
-		for idx in range(batch_size):
-			logger.debug(f'Decoding sample {batch_guids[idx]}')
-			beam_src_seq = batch_src_seq[idx].unsqueeze(0).to(self.device)  # Batch with 1 sample
-			beam_enc_output = batch_enc_output[idx].unsqueeze(0)   # Batch with 1 sample
-
-			beams = []
-			start_node = BeamSearchNode(prev_node=None, token_id=Constants.BOS, log_prob=0)
-			beams.append((start_node.eval(), start_node))
-
-			end_nodes = []
-
-			# Start decoding process for each source sequence
-			for step in range(Constants.MAX_TGT_SEQ_LEN):
-				logger.debug(f'Decoding step {step} with {len(beams)} beams')
-				candidates = []
-
-				for score, node in beams:
-					dec_seq = node.seq_tokens  # [id_1, id_2]
-					beam_dec_seq = torch.LongTensor(dec_seq).unsqueeze(0)  # Batch with 1 sample
-					beam_dec_seq.to(self.device)
-				
-					# Decode for one step using decoder
-					logger.debug('Getting decoder logits')
-					output_logits, output_attentions = self.decoder.forward(batch_src_seq=beam_src_seq, batch_enc_output=beam_enc_output, batch_tgt_seq=beam_dec_seq)
-					log_probs = log_softmax(output_logits[:, -1][0], dim=-1)	# output_logits shape: (batch_size, seq_len, vocab_size); log_probs shape: (vocab_size)
-					sorted_log_probs, sorted_indices = torch.sort(log_probs, dim=-1, descending=True)
-					logger.debug('Logits sorted by log probs')
-
-					# Collect top beam_size candidates for this beam instance
-					candidate_count = 0
-					i = 0
-
-					while candidate_count < beam_size:
-						logger.debug(f'Collecting candidate {candidate_count}')
-						logger.debug(f'Hypothesis {i}')
-						decoded_token = sorted_indices[i].item()
-						log_prob = sorted_log_probs[i].item()
-						i += 1
-
-						next_node = BeamSearchNode(prev_node=node, token_id=decoded_token, log_prob=node.log_prob + log_prob)
-
-						# Block ngram repeats
-						if Params.block_ngram_repeat > 0:
-							logger.debug('Checking repeat ngrams')
-							ngrams = set()
-							has_repeats = False
-							gram = []
-
-							for j in range(len(next_node.seq_tokens)):
-								# A gram is combination of the last n tokens where n = block_ngram_repeat param
-								gram = (gram + [next_node.seq_tokens[j]])[-Params.block_ngram_repeat:]
-								
-								# Skip the blocking if it is in the exclusion list
-								# if set(gram) & self.exclusion_tokens:
-								# 	continue
-								
-								# Repeats detected, we can break here
-								if tuple(gram) in ngrams:
-									logger.debug('Repeated ngram: ' + ' '.join(map(str, gram)))
-									has_repeats = True
-									break
-								# No repeat for now, add this gram to the ngram set
-								else:
-									ngrams.add(tuple(gram))
-
-							# Add penalty to this hypothesis to prevent it from expanding its path
-							if has_repeats:
-								penaltized_log_prob = next_node.log_prob + (-10e20)
-								next_node.set_log_prob(penaltized_log_prob)
-						
-						# This candidate finished its path
-						if decoded_token == Constants.EOS:
-							logger.debug('End node found!')
-
-							if Params.min_tgt_len > 0:
-								# Collect this end node if it has valid sequence length
-								if next_node.seq_len >= Params.min_tgt_len:
-									end_nodes.append((next_node.eval(), next_node))
-							else:
-								end_nodes.append((next_node.eval(), next_node))
-						# This candidate is still expanding
-						else:
-							candidates.append((next_node.eval(), next_node))
-							candidate_count += 1
-
-				# Stop decoding as we found enough end nodes
-				if len(end_nodes) >= n_best:
-					break
-
-				# Collect beam_size best candidates for next time step decoding
-				logger.debug(f'Candidates count: {len(candidates)}')
-				sorted_candidates = sorted(candidates, key=operator.itemgetter(0), reverse=True)
-				beams = []	# Reset beam list here to maintain only beam_size hypothesis
-    
-				for i in range(beam_size):
-					beams.append(sorted_candidates[i])
-
-			# Get n_best hypotheses at the end of decoding process
-			logger.debug(f'Collecting {n_best} best hypotheses')
-			best_hypotheses = []
-
-			sorted_beams = sorted(beams, key=operator.itemgetter(0), reverse=True)
-
-			if len(end_nodes) < n_best:
-				for i in range(n_best - len(end_nodes)):
-					end_nodes.append(sorted_beams[i])
-
-			sorted_end_nodes = sorted(end_nodes, key=operator.itemgetter(0), reverse=True)
-
-			for i in range(n_best):
-				score, end_node = sorted_end_nodes[i]
-				best_hypotheses.append((score, end_node.seq_tokens))
-
-			decoded_batch.append(best_hypotheses)
-
-		return decoded_batch
-
-class BeamSearchNode(object):
-	def __init__(self, prev_node, token_id, log_prob):
-		self.finished = False   # Determine if the hypothesis decoding is finished
-		self.prev_node = prev_node
-		self.token_id = token_id
-		self.log_prob = log_prob
-
-		if prev_node is None:
-			self.seq_tokens = [token_id]
-		else:
-			self.seq_tokens = prev_node.seq_tokens + [token_id]
-
-		self.seq_len = len(self.seq_tokens)
-
-		if token_id == Constants.EOS:
-			self.finished = True
-
-	def set_log_prob(self, log_prob):
-		self.log_prob = log_prob
-
-	# Get beam sore with Wu's length normalization (https://arxiv.org/abs/1609.08144)
-	# Adopt pytorch code from https://github.com/NVIDIA/DeepLearningExamples/blob/master/PyTorch/Translation/GNMT/seq2seq/inference/beam_search.py
-	def eval(self):
-		score = self.log_prob
-
-		# Set Params.len_norm_factor = 0 will disable length normalization
-		norm_const = 5
-		length_norm = (norm_const + self.seq_len) / (norm_const + 1.0)
-		length_norm = length_norm ** Params.len_norm_factor
-		score = score / length_norm
-  
-		return score
-
-	def __lt__(self, other):
-		return self.seq_len < other.seq_len
-
-	def __gt__(self, other):
-		return self.seq_len > other.seq_len
+        return dec_seq
