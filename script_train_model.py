@@ -1,4 +1,3 @@
-# train.py (full file)
 import os
 import sys
 import random
@@ -87,10 +86,11 @@ def get_model(rank, device, checkpoint, output_dir):
 	model = BertAbsSum(config=config, device=device)
 
 	if checkpoint:
-		# checkpoint may be the dict saved by previous run
-		if 'model_state_dict' in checkpoint:
-			model.load_state_dict(checkpoint['model_state_dict'])
+		# checkpoint is expected to be a dict with "model_state_dict"
+		if "model_state_dict" in checkpoint:
+			model.load_state_dict(checkpoint["model_state_dict"])
 		else:
+			# backward compatibility
 			model.load_state_dict(checkpoint)
 
 	model.to(device)
@@ -120,7 +120,7 @@ def get_optimizer(model, checkpoint):
 
 	opt = torch.optim.AdamW(groups, lr=Params.learning_rate)
 
-	if checkpoint and 'optimizer_state_dict' in checkpoint:
+	if checkpoint and "optimizer_state_dict" in checkpoint:
 		opt.load_state_dict(checkpoint["optimizer_state_dict"])
 
 	return opt
@@ -158,7 +158,6 @@ def check_data(dataloader):
 
 
 def cal_performance(logits, ground):
-	# ground: [B, T] original target including BOS/EOS; model.forward expects input shifted so we shift ground here
 	ground = ground[:, 1:]
 	logits = logits.view(-1, logits.size(-1))
 	ground = ground.contiguous().view(-1)
@@ -175,9 +174,40 @@ def cal_performance(logits, ground):
 
 
 def init_parameters(model):
-	for n, p in model.named_parameters():
+	# Support DDP-wrapped model
+	params_iter = model.module.named_parameters() if isinstance(model, DistributedDataParallel) else model.named_parameters()
+	for n, p in params_iter:
 		if "encoder" not in n and "tgt_embed" not in n and p.dim() > 1:
 			xavier_normal_(p)
+
+
+# New: evaluate function
+def evaluate(rank, model, valid_loader, device):
+	model_eval = model.module if isinstance(model, DistributedDataParallel) else model
+	model_eval.eval()
+	total_loss = 0.0
+	total_tokens = 0
+	with torch.no_grad():
+		for batch in valid_loader:
+			batch_src = batch[1].to(device)
+			batch_mask = batch[2].to(device)
+			batch_tgt = batch[3].to(device)
+			tgt_mask = batch[4].to(device)
+
+			logits = model_eval(
+				batch_src_seq=batch_src,
+				batch_src_mask=batch_mask,
+				batch_tgt_seq=batch_tgt,
+				batch_tgt_mask=tgt_mask
+			)
+
+			loss, correct, n_tokens = cal_performance(logits, batch_tgt)
+			total_loss += loss.item() * n_tokens
+			total_tokens += n_tokens
+
+	if total_tokens == 0:
+		return float("inf")
+	return total_loss / total_tokens
 
 
 def train(rank, world_size, output_dir):
@@ -191,8 +221,20 @@ def train(rank, world_size, output_dir):
 	train_loader = get_train_dataloader(rank, world_size)
 	valid_loader = get_valid_dataloader(rank, world_size)
 
+	# Try to load resume checkpoint if requested
 	checkpoint = None
+	if getattr(Params, "resume_from_epoch", 0) > 0 and getattr(Params, "resume_checkpoint_dir", None):
+		# prefer explicit checkpoint file name pattern, fallback to Best_Checkpoint.pt
+		cp_path = os.path.join(Params.resume_checkpoint_dir, f"checkpoint_epoch_{Params.resume_from_epoch}.pt")
+		if not os.path.exists(cp_path):
+			cp_path = os.path.join(Params.resume_checkpoint_dir, "Best_Checkpoint.pt")
+		if os.path.exists(cp_path):
+			logger.info(f"Loading checkpoint from {cp_path}")
+			checkpoint = torch.load(cp_path, map_location=device)
+		else:
+			logger.info("Requested resume checkpoint not found, starting fresh.")
 
+	# synchronize before model init when multi-gpu
 	if num_gpus > 1:
 		dist.barrier()
 
@@ -201,9 +243,17 @@ def train(rank, world_size, output_dir):
 
 	optimizer = get_optimizer(model, checkpoint)
 
+	# Scheduler setup
+	num_training_steps = len(train_loader) * Params.num_train_epochs if len(train_loader) > 0 else 0
+	warmup_steps = getattr(Params, "warmup_steps", 0)
+	scheduler = None
+	if num_training_steps > 0:
+		scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=num_training_steps)
+
 	# ---- Main training ---- #
 	model.train()
 	global_step = 0
+	best_val_loss = float("inf")
 
 	for epoch in range(1, Params.num_train_epochs + 1):
 		train_iter = tqdm(train_loader, desc=f"Epoch {epoch}", ascii=True)
@@ -216,7 +266,10 @@ def train(rank, world_size, output_dir):
 			batch_tgt = batch[3].to(device)
 			tgt_mask = batch[4].to(device)
 
-			logits = model(
+			# Use model.module for forward if DDP wrapper is present
+			model_forward = model.module if isinstance(model, DistributedDataParallel) else model
+
+			logits = model_forward(
 				batch_src_seq=batch_src,
 				batch_src_mask=batch_mask,
 				batch_tgt_seq=batch_tgt,
@@ -227,23 +280,43 @@ def train(rank, world_size, output_dir):
 
 			optimizer.zero_grad()
 			loss.backward()
+
+			# gradient clipping
+			max_norm = getattr(Params, "max_grad_norm", 1.0)
+			params_to_clip = model.module.parameters() if isinstance(model, DistributedDataParallel) else model.parameters()
+			torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm)
+
 			optimizer.step()
+			if scheduler:
+				scheduler.step()
 
 			if rank == 0:
 				train_iter.set_postfix({"Loss": loss.item()})
 
-	# Main process only: save best checkpoint
-	if rank == 0:
-		# Save compatible dict with keys used by loader code
-		save_dict = {
-			'epoch': epoch,
-			'model_state_dict': model.module.state_dict() if isinstance(model, DistributedDataParallel) else model.state_dict(),
-			'optimizer_state_dict': optimizer.state_dict(),
-			'loss': loss.item() if 'loss' in locals() else 0.0
-		}
-		torch.save(save_dict, os.path.join(output_dir, "Best_Checkpoint.pt"))
-		logger.info("Training finished.")
+		# After each epoch evaluate on validation set (main rank only)
+		if rank == 0:
+			val_loss = evaluate(rank, model, valid_loader, device)
+			logger.info(f"Epoch {epoch} validation loss: {val_loss:.6f}")
 
+			# Save checkpoint for this epoch
+			state = {
+				"epoch": epoch,
+				"model_state_dict": model.module.state_dict() if isinstance(model, DistributedDataParallel) else model.state_dict(),
+				"optimizer_state_dict": optimizer.state_dict(),
+				"scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None
+			}
+			cp_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch}.pt")
+			torch.save(state, cp_path)
+			logger.info(f"Saved checkpoint: {cp_path}")
+
+			# Save best
+			if val_loss < best_val_loss:
+				best_val_loss = val_loss
+				best_path = os.path.join(output_dir, "Best_Checkpoint.pt")
+				torch.save(state, best_path)
+				logger.info(f"Saved best checkpoint: {best_path}")
+
+	# Cleanup and finalize
 	if world_size > 1:
 		dist.destroy_process_group()
 
