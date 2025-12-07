@@ -22,8 +22,6 @@ from params_helper import Constants, Params
 set_seed(0)
 
 logger = get_logger(__name__)
-
-# Force enable GPU in Colab
 if Params.visible_gpus == "-1":
 	Params.visible_gpus = "0"
 
@@ -77,8 +75,6 @@ def get_model(rank, device, checkpoint, output_dir):
 			},
 			"freeze_encoder": Params.freeze_encoder
 		}
-
-	# Save config only on main process
 	if rank == 0:
 		with open(os.path.join(output_dir, "config.json"), "w") as f:
 			json.dump(config, f, indent=4, default=str)
@@ -86,16 +82,12 @@ def get_model(rank, device, checkpoint, output_dir):
 	model = BertAbsSum(config=config, device=device)
 
 	if checkpoint:
-		# checkpoint is expected to be a dict with "model_state_dict"
 		if "model_state_dict" in checkpoint:
 			model.load_state_dict(checkpoint["model_state_dict"])
 		else:
-			# backward compatibility
 			model.load_state_dict(checkpoint)
 
 	model.to(device)
-
-	# Wrap with DDP only when multi-GPU
 	if num_gpus > 1:
 		model = DistributedDataParallel(
 			model,
@@ -174,14 +166,11 @@ def cal_performance(logits, ground):
 
 
 def init_parameters(model):
-	# Support DDP-wrapped model
 	params_iter = model.module.named_parameters() if isinstance(model, DistributedDataParallel) else model.named_parameters()
 	for n, p in params_iter:
 		if "encoder" not in n and "tgt_embed" not in n and p.dim() > 1:
 			xavier_normal_(p)
 
-
-# New: evaluate function
 def evaluate(rank, model, valid_loader, device):
 	model_eval = model.module if isinstance(model, DistributedDataParallel) else model
 	model_eval.eval()
@@ -221,10 +210,8 @@ def train(rank, world_size, output_dir):
 	train_loader = get_train_dataloader(rank, world_size)
 	valid_loader = get_valid_dataloader(rank, world_size)
 
-	# Try to load resume checkpoint if requested
 	checkpoint = None
 	if getattr(Params, "resume_from_epoch", 0) > 0 and getattr(Params, "resume_checkpoint_dir", None):
-		# prefer explicit checkpoint file name pattern, fallback to Best_Checkpoint.pt
 		cp_path = os.path.join(Params.resume_checkpoint_dir, f"checkpoint_epoch_{Params.resume_from_epoch}.pt")
 		if not os.path.exists(cp_path):
 			cp_path = os.path.join(Params.resume_checkpoint_dir, "Best_Checkpoint.pt")
@@ -233,8 +220,6 @@ def train(rank, world_size, output_dir):
 			checkpoint = torch.load(cp_path, map_location=device)
 		else:
 			logger.info("Requested resume checkpoint not found, starting fresh.")
-
-	# synchronize before model init when multi-gpu
 	if num_gpus > 1:
 		dist.barrier()
 
@@ -243,14 +228,12 @@ def train(rank, world_size, output_dir):
 
 	optimizer = get_optimizer(model, checkpoint)
 
-	# Scheduler setup
 	num_training_steps = len(train_loader) * Params.num_train_epochs if len(train_loader) > 0 else 0
 	warmup_steps = getattr(Params, "warmup_steps", 0)
 	scheduler = None
 	if num_training_steps > 0:
 		scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=num_training_steps)
 
-	# ---- Main training ---- #
 	model.train()
 	global_step = 0
 	best_val_loss = float("inf")
@@ -265,8 +248,6 @@ def train(rank, world_size, output_dir):
 			batch_mask = batch[2].to(device)
 			batch_tgt = batch[3].to(device)
 			tgt_mask = batch[4].to(device)
-
-			# Use model.module for forward if DDP wrapper is present
 			model_forward = model.module if isinstance(model, DistributedDataParallel) else model
 
 			logits = model_forward(
@@ -280,8 +261,6 @@ def train(rank, world_size, output_dir):
 
 			optimizer.zero_grad()
 			loss.backward()
-
-			# gradient clipping
 			max_norm = getattr(Params, "max_grad_norm", 1.0)
 			params_to_clip = model.module.parameters() if isinstance(model, DistributedDataParallel) else model.parameters()
 			torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm)
@@ -292,13 +271,9 @@ def train(rank, world_size, output_dir):
 
 			if rank == 0:
 				train_iter.set_postfix({"Loss": loss.item()})
-
-		# After each epoch evaluate on validation set (main rank only)
 		if rank == 0:
 			val_loss = evaluate(rank, model, valid_loader, device)
 			logger.info(f"Epoch {epoch} validation loss: {val_loss:.6f}")
-
-			# Save checkpoint for this epoch
 			state = {
 				"epoch": epoch,
 				"model_state_dict": model.module.state_dict() if isinstance(model, DistributedDataParallel) else model.state_dict(),
@@ -308,15 +283,11 @@ def train(rank, world_size, output_dir):
 			cp_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch}.pt")
 			torch.save(state, cp_path)
 			logger.info(f"Saved checkpoint: {cp_path}")
-
-			# Save best
 			if val_loss < best_val_loss:
 				best_val_loss = val_loss
 				best_path = os.path.join(output_dir, "Best_Checkpoint.pt")
 				torch.save(state, best_path)
 				logger.info(f"Saved best checkpoint: {best_path}")
-
-	# Cleanup and finalize
 	if world_size > 1:
 		dist.destroy_process_group()
 

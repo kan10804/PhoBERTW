@@ -69,7 +69,6 @@ def _parse_arguments():
 
 	params = parser.parse_args()
 
-	# Convert string to bool
 	bool_attributes = ['logger_debug', 'quick_test', 'freeze_encoder', 'log_loss_every_step']	# Don't forget to update this list when the arguments change
  
 	for attribute in bool_attributes:
@@ -77,7 +76,6 @@ def _parse_arguments():
 			bool_value = bool(strtobool(getattr(params, attribute)))
 			setattr(params, attribute, bool_value)
 
-	# Just for quick testing when training
 	if params.quick_test:
 		if 'script_train_model' in executed_script_name:
 			setattr(params, 'num_train_epochs', 5)
@@ -141,6 +139,5 @@ Constants = _get_constants(Params)
 print('Constants: ', Constants)
 print('\n')
 
-# Delete variable and functions after use to prevent calling from other place
 del _parse_arguments
 del _get_constants

@@ -9,7 +9,6 @@ from transformer_preprocess import CSVProcessor
 from transformer_utils import *
 from params_helper import Params, Constants
 
-# Setup logger
 logger = get_logger(__name__)
 
 
@@ -33,10 +32,8 @@ def prepare_data(tokenizer, csv_file_path, data_type, max_rows, max_src_len, max
 	logger.info(f'Saving {data_type} dataset into {preprocessed_dataset_path}')
 	torch.save(dataset, preprocessed_dataset_path)
 
-
-# Usage: python prepare_dataset.py -visible_gpus='2' -bert_model='vinai/phobert-large' -max_rows=-1 -max_src_len=512 -max_tgt_len=128 -train_csv_path='path/to/file' -valid_csv_path='path/to/file' -test_csv_path='path/to/file'
 if __name__ == '__main__':
-	# Validate csv files
+
 	if not os.path.exists(Params.train_csv_path):
 		logger.info(f'Error: Train data file {Params.train_csv_path} does not exist!')
 		sys.exit(0)
@@ -49,14 +46,12 @@ if __name__ == '__main__':
 		logger.info(f'Error: Test data file {Params.test_csv_path} does not exist!')
 		sys.exit(0)
 
-	# Set visible GPUs
+
 	os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 	os.environ['CUDA_VISIBLE_DEVICES'] = Params.visible_gpus
 
-	# Init tokenizer
 	tokenizer = AutoTokenizer.from_pretrained(Params.bert_model, local_files_only=False)
 
-	# Process data
 	prepare_data(
 		tokenizer=tokenizer,
 		csv_file_path=Params.train_csv_path,

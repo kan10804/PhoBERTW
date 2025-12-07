@@ -16,17 +16,15 @@ from params_helper import Params, Constants
 
 set_seed(0)
 
-# Setup logger
 logger = get_logger(__name__)
 
 BOS_TOKEN = Constants.BOS_TOKEN
 EOS_TOKEN = Constants.EOS_TOKEN
 
-# Set visible GPUs
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 os.environ['CUDA_VISIBLE_DEVICES'] = Params.visible_gpus
 
-# Init tokenizer
+
 tokenizer = AutoTokenizer.from_pretrained(Params.bert_model)
 
 
@@ -38,7 +36,7 @@ def load_data():
 	dataloader = processor.create_dataloader(dataset, Params.batch_size, shuffle=False)
 
 	logger.info('*** Checking data ***')
-	batch = next(iter(dataloader)) # Batch is a tuple of tensors (guids, src_ids, scr_mask, tgt_ids, tgt_mask)
+	batch = next(iter(dataloader)) 
 	batch_guids = batch[0]
 	batch_src_ids = batch[1]
 	batch_tgt_ids = batch[3]
@@ -55,13 +53,11 @@ def load_model(device):
 	base_dir = os.path.dirname(Params.model_path)
 	config_path = os.path.join(base_dir, 'config.json')
 
-	# Load config
 	logger.info(f'*** Loading config from {config_path} ***')
 
 	with open(config_path, 'r') as f:
 		config = json.load(f)
 
-	# Load model
 	model = BertAbsSum(config=config, device=device)
 	
 	logger.info(f'*** Loading model state dict: {Params.model_path} ***')
@@ -75,7 +71,7 @@ def greed_decode_one_sample(model, dataloader, device):
 	print('\n\n')
 	logger.info('***** Greedy decode one sample *****')
 	model.eval()
-	batch = next(iter(dataloader)) # Batch is a tuple of tensors (guids, src_ids, scr_mask, tgt_ids, tgt_mask)
+	batch = next(iter(dataloader)) 
 	batch_src_ids = batch[1]
 	batch_tgt_ids = batch[3]
 
@@ -90,7 +86,7 @@ def decode_one_sample(model, dataloader, device):
 	print('\n\n')
 	logger.info('***** Evaluating one sample *****')
 	model.eval()
-	batch = next(iter(dataloader)) # Batch is a tuple of tensors (guids, src_ids, scr_mask, tgt_ids, tgt_mask)
+	batch = next(iter(dataloader)) 
 	batch_guids = batch[0]
 	batch_src_ids = batch[1]
 	batch_src_mask = batch[2]
@@ -161,15 +157,12 @@ def evaluate(model, dataloader, output_dir, device):
 		'predict_log': []
 	}
 
-	# Decode samples
 	all_labels = []
 	all_predicts = []
 
 	with torch.no_grad():
 		for index, batch in enumerate(tqdm(dataloader, desc='Evaluation step', position=0, leave=True, ascii=True)):
 			step = index + 1
-
-			# Batch is a tuple of tensors (guids, src_ids, scr_mask, tgt_ids, tgt_mask)
 			batch_guids = batch[0]
 			batch_src_ids = batch[1]
 			batch_src_mask = batch[2]
@@ -192,7 +185,6 @@ def evaluate(model, dataloader, output_dir, device):
 
 			batch_output_summaries = tokenizer.batch_decode(batch_predict_ids, skip_special_tokens=True)
 
-			# Collect hypotheses
 			for i in range(len(batch_guids)):
 				beam_hyps = {}
     
@@ -208,7 +200,6 @@ def evaluate(model, dataloader, output_dir, device):
 			all_labels = all_labels + batch_labels
 			all_predicts = all_predicts + batch_output_summaries
 
-			# Print output of the first sample in the batch
 			if step % Params.print_predict_every == 0:
 				guid = batch_guids[0]
 				target_tokens = batch_labels[0]
@@ -224,7 +215,6 @@ def evaluate(model, dataloader, output_dir, device):
 			if Params.quick_test and step == 5:
 				break
 
-	# Doing word desegmentation before caculating ROUGE scores
 	all_desegmented_labels = [text.replace('_', ' ') for text in all_labels]
 	all_desegmented_predicts = [text.replace('_', ' ') for text in all_predicts]
 
@@ -238,7 +228,6 @@ def evaluate(model, dataloader, output_dir, device):
 	eval_log['finish_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 	save_eval_log(output_dir, eval_log)
 
-	# Print metricts
 	rouge1 = eval_log['rouge_score']['rouge1']
 	rouge2 = eval_log['rouge_score']['rouge2']
 	rougeL = eval_log['rouge_score']['rougeL']
@@ -254,7 +243,6 @@ if __name__ == '__main__':
 	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 	logger.info(f'Using device: {device}')
 	
-	# Setup output path
 	output_dir = os.path.dirname(Params.model_path)
 	logger.info(f'Evaluation output dir: {output_dir}')
 
